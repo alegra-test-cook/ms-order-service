@@ -118,7 +118,6 @@ async function start() {
         createdAt: order.createdAt,
         finishedAt: order.finishedAt || null
       }));
-      await logger.info('order-service', `Se consultaron ${orders.length} pedidos`);
       res.json(response);
     } catch (error) {
       await logger.error('order-service', 'Error al listar pedidos', { error: error.message });
@@ -163,7 +162,6 @@ async function start() {
         parseInt(skip)
       );
       
-      await logger.info('order-service', `Se consultaron ${logs.length} logs por la ruta /orders/logs`);
       res.json(logs);
     } catch (error) {
       await logger.error('order-service', `Error al consultar logs: ${error.message}`);
@@ -293,7 +291,6 @@ async function start() {
         parseInt(skip)
       );
       
-      await logger.info('order-service', `Se consultaron ${logs.length} logs por la ruta /logs`);
       res.json(logs);
     } catch (error) {
       await logger.error('order-service', `Error al consultar logs: ${error.message}`);
