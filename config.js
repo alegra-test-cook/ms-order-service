@@ -19,7 +19,8 @@ const QUEUE_NAMES = {
 
 // Nombres de las colecciones en MongoDB
 const COLLECTIONS = {
-  ORDERS: 'orders'
+  ORDERS: 'orders',
+  LOGS: 'system_logs'
 };
 
 // Estados de los pedidos

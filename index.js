@@ -1,14 +1,42 @@
 const express = require('express');
 const amqp = require('amqplib');
 const { MongoClient, ObjectId } = require('mongodb');
+const cors = require('cors');  // Añadimos CORS
 
-// Importar configuraciones
+// Importar configuraciones y logger
 const { PORT, RABBIT_URL, MONGO_URL, QUEUE_NAMES, COLLECTIONS, ORDER_STATUS } = require('./config');
+const logger = require('./logger');
 
 const app = express();
+
+// Configurar CORS
+app.use(cors({
+  origin: '*',  // Permite todas las origenes - ajustar en producción
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
+// Función para validar si un string es un ObjectId válido
+function isValidObjectId(id) {
+  try {
+    if (id === undefined || id === null) return false;
+    
+    // Verificar si el id tiene 24 caracteres hexadecimales
+    return /^[0-9a-fA-F]{24}$/.test(id);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function start() {
+  // Inicializar el logger
+  await logger.initLogger();
+  
+  // Log de inicio del servicio
+  await logger.info('order-service', 'Servicio de órdenes iniciado');
+  
   const client = new MongoClient(MONGO_URL);
   await client.connect();
   const db = client.db('restaurant');
@@ -18,11 +46,41 @@ async function start() {
   const channel = await connection.createChannel();
   await channel.assertQueue(QUEUE_NAMES.ORDERS);
   await channel.assertQueue(QUEUE_NAMES.ORDER_DONE);
+  
+  // Cola para logs del sistema
+  await channel.assertQueue('system_logs');
+  
+  // Escuchar los logs de otros microservicios
+  channel.consume('system_logs', async (msg) => {
+    if (!msg) return;
+    try {
+      const logData = JSON.parse(msg.content.toString());
+      // Guardar el log en MongoDB usando nuestro logger local
+      await logger.getLogs(); // Esto asegura que la colección esté inicializada
+      
+      // Insertar directamente ya que el objeto ya viene formateado
+      const logsColl = client.db().collection(COLLECTIONS.LOGS);
+      await logsColl.insertOne(logData);
+      
+      channel.ack(msg);
+    } catch (err) {
+      await logger.error('order-service', 'Error procesando log de otro servicio', { error: err.message });
+      channel.ack(msg); // Aún con error, no queremos reencolar
+    }
+  });
 
   channel.consume(QUEUE_NAMES.ORDER_DONE, async (msg) => {
     if (!msg) return;
-    const { orderId, dish, image, description } = JSON.parse(msg.content.toString());
     try {
+      const { orderId, dish, image, description } = JSON.parse(msg.content.toString());
+      
+      // Validar el ID de la orden
+      if (!isValidObjectId(orderId)) {
+        await logger.error('order-service', `ID de orden inválido en mensaje ORDER_DONE: ${orderId}`);
+        channel.ack(msg);
+        return;
+      }
+      
       await ordersColl.updateOne(
         { _id: new ObjectId(orderId) },
         { 
@@ -35,9 +93,9 @@ async function start() {
           } 
         }
       );
-      console.log(`✔ Pedido ${orderId} marcado como finalizado (Plato: ${dish}).`);
+      await logger.info('order-service', `Pedido ${orderId} marcado como finalizado (Plato: ${dish}).`);
     } catch (err) {
-      console.error(`✘ Error actualizando pedido ${orderId}:`, err);
+      await logger.error('order-service', `Error actualizando pedido`, { error: err.message });
     }
     channel.ack(msg);
   });
@@ -50,35 +108,13 @@ async function start() {
       };
       const result = await ordersColl.insertOne(newOrder);
       const orderId = result.insertedId.toString();
-      console.log(`➕ Nuevo pedido recibido. ID: ${orderId}`);
+      await logger.info('order-service', `Nuevo pedido recibido. ID: ${orderId}`);
       const msg = { orderId: orderId };
       channel.sendToQueue(QUEUE_NAMES.ORDERS, Buffer.from(JSON.stringify(msg)));
       res.status(202).json({ orderId: orderId, status: ORDER_STATUS.IN_PROGRESS });
     } catch (error) {
-      console.error('✘ Error al crear nuevo pedido:', error);
+      await logger.error('order-service', 'Error al crear nuevo pedido', { error: error.message });
       res.status(500).send('Error al procesar el pedido');
-    }
-  });
-
-  app.get('/orders/:id', async (req, res) => {
-    try {
-      const orderId = req.params.id;
-      const order = await ordersColl.findOne({ _id: new ObjectId(orderId) });
-      if (!order) {
-        return res.status(404).send('Pedido no encontrado');
-      }
-      res.json({
-        orderId: order._id.toString(),
-        status: order.status,
-        dish: order.dish || null,
-        image: order.image || null,
-        description: order.description || null,
-        createdAt: order.createdAt,
-        finishedAt: order.finishedAt || null
-      });
-    } catch (error) {
-      console.error('✘ Error al obtener pedido:', error);
-      res.status(500).send('Error del servidor');
     }
   });
 
@@ -94,9 +130,94 @@ async function start() {
         createdAt: order.createdAt,
         finishedAt: order.finishedAt || null
       }));
+      await logger.info('order-service', `Se consultaron ${orders.length} pedidos`);
       res.json(response);
     } catch (error) {
-      console.error('✘ Error al listar pedidos:', error);
+      await logger.error('order-service', 'Error al listar pedidos', { error: error.message });
+      res.status(500).send('Error del servidor');
+    }
+  });
+
+  // Ruta específica para /orders/logs (debe estar antes de /orders/:id para evitar conflictos)
+  app.get('/orders/logs', async (req, res) => {
+    try {
+      const { 
+        service, 
+        level, 
+        limit = 100, 
+        skip = 0,
+        startDate,
+        endDate
+      } = req.query;
+      
+      const filter = {};
+      
+      // Filtrar por servicio si se especifica
+      if (service) {
+        filter.service = service;
+      }
+      
+      // Filtrar por nivel de log si se especifica
+      if (level) {
+        filter.level = level;
+      }
+      
+      // Filtrar por rango de fechas si se especifica
+      if (startDate || endDate) {
+        filter.timestamp = {};
+        if (startDate) {
+          filter.timestamp.$gte = new Date(startDate);
+        }
+        if (endDate) {
+          filter.timestamp.$lte = new Date(endDate);
+        }
+      }
+      
+      const logs = await logger.getLogs(
+        filter, 
+        parseInt(limit),
+        parseInt(skip)
+      );
+      
+      await logger.info('order-service', `Se consultaron ${logs.length} logs por la ruta /orders/logs`);
+      res.json(logs);
+    } catch (error) {
+      await logger.error('order-service', `Error al consultar logs: ${error.message}`);
+      res.status(500).send('Error al consultar logs');
+    }
+  });
+
+  app.get('/orders/:id', async (req, res) => {
+    try {
+      const orderId = req.params.id;
+      
+      // Validar el ID de la orden
+      if (!isValidObjectId(orderId)) {
+        await logger.warning('order-service', `Intento de consulta con ID inválido: ${orderId}`);
+        return res.status(400).json({ 
+          error: 'ID de orden inválido',
+          message: 'El ID proporcionado no es un ObjectId de MongoDB válido'
+        });
+      }
+      
+      const order = await ordersColl.findOne({ _id: new ObjectId(orderId) });
+      if (!order) {
+        await logger.warning('order-service', `Pedido no encontrado con ID: ${orderId}`);
+        return res.status(404).send('Pedido no encontrado');
+      }
+      
+      await logger.info('order-service', `Pedido consultado: ${orderId}`);
+      res.json({
+        orderId: order._id.toString(),
+        status: order.status,
+        dish: order.dish || null,
+        image: order.image || null,
+        description: order.description || null,
+        createdAt: order.createdAt,
+        finishedAt: order.finishedAt || null
+      });
+    } catch (error) {
+      await logger.error('order-service', 'Error al obtener pedido', { error: error.message, orderId: req.params.id });
       res.status(500).send('Error del servidor');
     }
   });
@@ -105,9 +226,20 @@ async function start() {
   app.get('/orders/:id/details', async (req, res) => {
     try {
       const orderId = req.params.id;
+      
+      // Validar el ID de la orden
+      if (!isValidObjectId(orderId)) {
+        await logger.warning('order-service', `Intento de consulta de detalles con ID inválido: ${orderId}`);
+        return res.status(400).json({ 
+          error: 'ID de orden inválido',
+          message: 'El ID proporcionado no es un ObjectId de MongoDB válido'
+        });
+      }
+      
       const order = await ordersColl.findOne({ _id: new ObjectId(orderId) });
       
       if (!order) {
+        await logger.warning('order-service', `Detalles de pedido no encontrado con ID: ${orderId}`);
         return res.status(404).send('Pedido no encontrado');
       }
       
@@ -126,10 +258,12 @@ async function start() {
           processingTime: order.finishedAt ? 
             Math.round((order.finishedAt - order.createdAt) / 1000) : null // Tiempo en segundos
         };
+        await logger.info('order-service', `Detalles de pedido completado consultados: ${orderId}`);
         return res.json(detailedResponse);
       }
       
       // Si el pedido aún está en proceso
+      await logger.info('order-service', `Detalles de pedido en preparación consultados: ${orderId}`);
       return res.json({
         orderId: order._id.toString(),
         status: order.status,
@@ -138,17 +272,72 @@ async function start() {
       });
       
     } catch (error) {
-      console.error('✘ Error al obtener detalles del pedido:', error);
+      await logger.error('order-service', 'Error al obtener detalles del pedido', { error: error.message, orderId: req.params.id });
       res.status(500).send('Error del servidor');
     }
   });
 
+  // Endpoint para obtener logs (ruta original)
+  app.get('/logs', async (req, res) => {
+    try {
+      const { 
+        service, 
+        level, 
+        limit = 100, 
+        skip = 0,
+        startDate,
+        endDate
+      } = req.query;
+      
+      const filter = {};
+      
+      // Filtrar por servicio si se especifica
+      if (service) {
+        filter.service = service;
+      }
+      
+      // Filtrar por nivel de log si se especifica
+      if (level) {
+        filter.level = level;
+      }
+      
+      // Filtrar por rango de fechas si se especifica
+      if (startDate || endDate) {
+        filter.timestamp = {};
+        if (startDate) {
+          filter.timestamp.$gte = new Date(startDate);
+        }
+        if (endDate) {
+          filter.timestamp.$lte = new Date(endDate);
+        }
+      }
+      
+      const logs = await logger.getLogs(
+        filter, 
+        parseInt(limit),
+        parseInt(skip)
+      );
+      
+      await logger.info('order-service', `Se consultaron ${logs.length} logs por la ruta /logs`);
+      res.json(logs);
+    } catch (error) {
+      await logger.error('order-service', `Error al consultar logs: ${error.message}`);
+      res.status(500).send('Error al consultar logs');
+    }
+  });
+
   app.listen(PORT, () => {
-    console.log(`🚀 Servicio de Pedidos escuchando en puerto ${PORT}`);
+    logger.info('order-service', `Servicio de Pedidos escuchando en puerto ${PORT}`);
   });
 }
 
-start().catch(err => {
-  console.error('✘ Error iniciando el Servicio de Pedidos:', err);
+start().catch(async err => {
+  // Intentar usar el logger, pero si falla usar console.error como último recurso
+  try {
+    await logger.error('order-service', `Error iniciando el Servicio de Pedidos: ${err.message}`, { stack: err.stack });
+  } catch (logError) {
+    console.error('✘ Error iniciando el Servicio de Pedidos:', err);
+    console.error('Error adicional al intentar registrar el error:', logError);
+  }
   process.exit(1);
 });
