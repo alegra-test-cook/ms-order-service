@@ -1,29 +1,24 @@
 const express = require('express');
 const amqp = require('amqplib');
 const { MongoClient, ObjectId } = require('mongodb');
-const cors = require('cors');  // Añadimos CORS
+const cors = require('cors');
 
-// Importar configuraciones y logger
 const { PORT, RABBIT_URL, MONGO_URL, QUEUE_NAMES, COLLECTIONS, ORDER_STATUS } = require('./config');
 const logger = require('./logger');
 
 const app = express();
 
-// Configurar CORS
 app.use(cors({
-  origin: '*',  // Permite todas las origenes - ajustar en producción
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 
-// Función para validar si un string es un ObjectId válido
 function isValidObjectId(id) {
   try {
     if (id === undefined || id === null) return false;
-    
-    // Verificar si el id tiene 24 caracteres hexadecimales
     return /^[0-9a-fA-F]{24}$/.test(id);
   } catch (e) {
     return false;
@@ -31,10 +26,8 @@ function isValidObjectId(id) {
 }
 
 async function start() {
-  // Inicializar el logger
   await logger.initLogger();
   
-  // Log de inicio del servicio
   await logger.info('order-service', 'Servicio de órdenes iniciado');
   
   const client = new MongoClient(MONGO_URL);
@@ -47,25 +40,21 @@ async function start() {
   await channel.assertQueue(QUEUE_NAMES.ORDERS);
   await channel.assertQueue(QUEUE_NAMES.ORDER_DONE);
   
-  // Cola para logs del sistema
   await channel.assertQueue('system_logs');
   
-  // Escuchar los logs de otros microservicios
   channel.consume('system_logs', async (msg) => {
     if (!msg) return;
     try {
       const logData = JSON.parse(msg.content.toString());
-      // Guardar el log en MongoDB usando nuestro logger local
-      await logger.getLogs(); // Esto asegura que la colección esté inicializada
+      await logger.getLogs();
       
-      // Insertar directamente ya que el objeto ya viene formateado
       const logsColl = client.db().collection(COLLECTIONS.LOGS);
       await logsColl.insertOne(logData);
       
       channel.ack(msg);
     } catch (err) {
       await logger.error('order-service', 'Error procesando log de otro servicio', { error: err.message });
-      channel.ack(msg); // Aún con error, no queremos reencolar
+      channel.ack(msg);
     }
   });
 
@@ -74,7 +63,6 @@ async function start() {
     try {
       const { orderId, dish, image, description } = JSON.parse(msg.content.toString());
       
-      // Validar el ID de la orden
       if (!isValidObjectId(orderId)) {
         await logger.error('order-service', `ID de orden inválido en mensaje ORDER_DONE: ${orderId}`);
         channel.ack(msg);
@@ -138,7 +126,6 @@ async function start() {
     }
   });
 
-  // Ruta específica para /orders/logs (debe estar antes de /orders/:id para evitar conflictos)
   app.get('/orders/logs', async (req, res) => {
     try {
       const { 
@@ -152,17 +139,14 @@ async function start() {
       
       const filter = {};
       
-      // Filtrar por servicio si se especifica
       if (service) {
         filter.service = service;
       }
       
-      // Filtrar por nivel de log si se especifica
       if (level) {
         filter.level = level;
       }
       
-      // Filtrar por rango de fechas si se especifica
       if (startDate || endDate) {
         filter.timestamp = {};
         if (startDate) {
@@ -191,7 +175,6 @@ async function start() {
     try {
       const orderId = req.params.id;
       
-      // Validar el ID de la orden
       if (!isValidObjectId(orderId)) {
         await logger.warning('order-service', `Intento de consulta con ID inválido: ${orderId}`);
         return res.status(400).json({ 
@@ -222,12 +205,10 @@ async function start() {
     }
   });
 
-  // Endpoint para obtener detalles completos de un pedido
   app.get('/orders/:id/details', async (req, res) => {
     try {
       const orderId = req.params.id;
       
-      // Validar el ID de la orden
       if (!isValidObjectId(orderId)) {
         await logger.warning('order-service', `Intento de consulta de detalles con ID inválido: ${orderId}`);
         return res.status(400).json({ 
@@ -243,7 +224,6 @@ async function start() {
         return res.status(404).send('Pedido no encontrado');
       }
       
-      // Si el pedido está completado, devolvemos toda la información
       if (order.status === ORDER_STATUS.COMPLETED) {
         const detailedResponse = {
           orderId: order._id.toString(),
@@ -256,13 +236,12 @@ async function start() {
             description: order.description
           },
           processingTime: order.finishedAt ? 
-            Math.round((order.finishedAt - order.createdAt) / 1000) : null // Tiempo en segundos
+            Math.round((order.finishedAt - order.createdAt) / 1000) : null
         };
         await logger.info('order-service', `Detalles de pedido completado consultados: ${orderId}`);
         return res.json(detailedResponse);
       }
       
-      // Si el pedido aún está en proceso
       await logger.info('order-service', `Detalles de pedido en preparación consultados: ${orderId}`);
       return res.json({
         orderId: order._id.toString(),
@@ -277,7 +256,6 @@ async function start() {
     }
   });
 
-  // Endpoint para obtener logs (ruta original)
   app.get('/logs', async (req, res) => {
     try {
       const { 
@@ -291,17 +269,14 @@ async function start() {
       
       const filter = {};
       
-      // Filtrar por servicio si se especifica
       if (service) {
         filter.service = service;
       }
       
-      // Filtrar por nivel de log si se especifica
       if (level) {
         filter.level = level;
       }
       
-      // Filtrar por rango de fechas si se especifica
       if (startDate || endDate) {
         filter.timestamp = {};
         if (startDate) {
@@ -332,7 +307,6 @@ async function start() {
 }
 
 start().catch(async err => {
-  // Intentar usar el logger, pero si falla usar console.error como último recurso
   try {
     await logger.error('order-service', `Error iniciando el Servicio de Pedidos: ${err.message}`, { stack: err.stack });
   } catch (logError) {
