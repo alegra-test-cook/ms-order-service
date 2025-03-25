@@ -28,7 +28,7 @@ function isValidObjectId(id) {
 async function start() {
   await logger.initLogger();
   
-  await logger.info('order-service', 'Servicio de órdenes iniciado');
+  await logger.info('order-service', '🍽️ Servicio de órdenes iniciado');
   
   const client = new MongoClient(MONGO_URL);
   await client.connect();
@@ -81,7 +81,7 @@ async function start() {
           } 
         }
       );
-      await logger.info('order-service', `Pedido ${orderId} marcado como finalizado (Plato: ${dish}).`);
+      await logger.info('order-service', `🍽️ Pedido ${orderId} marcado como finalizado (Plato: ${dish}).`);
     } catch (err) {
       await logger.error('order-service', `Error actualizando pedido`, { error: err.message });
     }
@@ -96,7 +96,7 @@ async function start() {
       };
       const result = await ordersColl.insertOne(newOrder);
       const orderId = result.insertedId.toString();
-      await logger.info('order-service', `Nuevo pedido recibido. ID: ${orderId}`);
+      await logger.info('order-service', `🍽️Nuevo pedido recibido. ID: ${orderId}`);
       const msg = { orderId: orderId };
       channel.sendToQueue(QUEUE_NAMES.ORDERS, Buffer.from(JSON.stringify(msg)));
       res.status(202).json({ orderId: orderId, status: ORDER_STATUS.IN_PROGRESS });
@@ -299,7 +299,7 @@ async function start() {
   });
 
   app.listen(PORT, () => {
-    logger.info('order-service', `Servicio de Pedidos escuchando en puerto ${PORT}`);
+    console.log('order-service', `Servicio de Pedidos escuchando en puerto ${PORT}`);
   });
 }
 
